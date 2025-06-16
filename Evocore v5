@@ -1,0 +1,216 @@
+import numpy as np
+import json
+import threading
+import time
+from enum import Enum
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+# Android-specific imports
+from android.hardware import Camera, Microphone
+from android.tts import TextToSpeech
+from android import content
+import tflite_runtime.interpreter as tflite
+
+# ======================
+# TENSORFLOW LITE MODELS
+# ======================
+class AIModels:
+    def __init__(self, context):
+        # Load models from assets
+        self.emotion_model = self._load_model(
+            context, "emotion_mobilenet.tflite")
+        self.wakeword_model = self._load_model(
+            context, "wakeword_lstm.tflite")
+        self.audio_classifier = self._load_model(
+            context, "yamnet_quantized.tflite")
+        
+        # Model metadata
+        self.input_details = {
+            "emotion": self.emotion_model.get_input_details(),
+            "wakeword": self.wakeword_model.get_input_details()
+        }
+        self.output_details = {
+            "emotion": self.emotion_model.get_output_details(),
+            "wakeword": self.wakeword_model.get_output_details()
+        }
+
+    def _load_model(self, context, filename):
+        asset_manager = context.getAssets()
+        fd = asset_manager.openFd(filename)
+        return tflite.Interpreter(fd.createInputStream())
+
+# ======================
+# ANDROID HARDWARE LAYER
+# ======================
+class AndroidHardware:
+    def __init__(self, context):
+        self.context = context
+        self.camera = Camera()
+        self.mic = Microphone()
+        self.tts = TextToSpeech(context)
+        self.wakeword_active = False
+        
+        # Camera setup (QVGA for mobile efficiency)
+        self.camera.setParameters(
+            "resolution=320x240,fps=15,format=NV21")
+        
+        # Audio setup (16kHz mono for wake word)
+        self.mic.setParameters(
+            "rate=16000,channels=1,format=PCM_16BIT")
+        
+        # TTS config
+        self.tts.setLanguage("en")
+        self.tts.setPitch(1.0)
+        self.tts.setSpeechRate(1.0)
+
+    def get_camera_frame(self):
+        """Captures and preprocesses camera frame"""
+        frame = self.camera.capture()
+        return self._preprocess_image(frame)
+
+    def get_audio_chunk(self, duration_ms=1000):
+        """Captures audio chunk for wake word detection"""
+        return self.mic.read(duration_ms)
+
+    def speak(self, text):
+        """Uses Android TTS with emotional inflection"""
+        self.tts.speak(text, TextToSpeech.QUEUE_FLUSH)
+
+    def _preprocess_image(self, frame):
+        """Prepares image for TF Lite (normalize, resize)"""
+        # Convert NV21 to RGB and normalize
+        img = np.frombuffer(frame, dtype=np.uint8)
+        img = img.reshape((240, 320, 3))  # QVGA
+        return img.astype(np.float32) / 255.0
+
+# ======================
+# WAKE WORD DETECTION
+# ======================
+class WakeWordDetector:
+    def __init__(self, model):
+        self.model = model
+        self.audio_buffer = np.zeros((16000,), dtype=np.float32)
+        self.threshold = 0.85
+        
+    def process_audio(self, audio_data):
+        """Runs wake word detection on audio chunk"""
+        # Maintain rolling buffer
+        self.audio_buffer = np.roll(self.audio_buffer, -len(audio_data))
+        self.audio_buffer[-len(audio_data):] = audio_data
+        
+        # Prepare input tensor
+        input_data = np.expand_dims(self.audio_buffer, axis=0)
+        input_data = np.expand_dims(input_data, axis=-1)
+        
+        # Run inference
+        self.model.set_tensor(
+            self.model.input_details[0]['index'], input_data)
+        self.model.invoke()
+        output = self.model.get_tensor(
+            self.model.output_details[0]['index'])
+        
+        return output[0][0] > self.threshold
+
+# ======================
+# INTEGRATED EVOCORE
+# ======================
+class EvoCore:
+    def __init__(self, context):
+        self.models = AIModels(context)
+        self.hardware = AndroidHardware(context)
+        self.wakeword_detector = WakeWordDetector(
+            self.models.wakeword_model)
+        
+        # Thread control
+        self.active = True
+        self.wakeword_thread = threading.Thread(
+            target=self._wakeword_monitor)
+        self.vision_thread = threading.Thread(
+            target=self._vision_processor)
+        
+    def start(self):
+        """Initializes all subsystems"""
+        self.wakeword_thread.start()
+        self.vision_thread.start()
+        self.speak("EvoCore 5.0 activated. Waiting for wake word.")
+
+    def stop(self):
+        """Safely shuts down all threads"""
+        self.active = False
+        self.wakeword_thread.join()
+        self.vision_thread.join()
+
+    def _wakeword_monitor(self):
+        """Continuous wake word monitoring"""
+        while self.active:
+            audio = self.hardware.get_audio_chunk(500)  # 500ms chunks
+            if self.wakeword_detector.process_audio(audio):
+                self.hardware.wakeword_active = True
+                self.speak("Yes? How can I help?")
+                time.sleep(2)  # Cooldown period
+            time.sleep(0.1)
+
+    def _vision_processor(self):
+        """Processes camera input with emotion detection"""
+        while self.active:
+            if self.hardware.wakeword_active:
+                frame = self.hardware.get_camera_frame()
+                emotion = self._detect_emotion(frame)
+                
+                if emotion != "neutral":
+                    self.speak(f"I sense {emotion} in your expression")
+                
+                time.sleep(1)  # Reduce processing load
+
+    def _detect_emotion(self, frame):
+        """Runs emotion classification on camera frame"""
+        self.models.emotion_model.set_tensor(
+            self.models.input_details["emotion"][0]['index'], 
+            np.expand_dims(frame, axis=0))
+        self.models.emotion_model.invoke()
+        
+        output = self.models.emotion_model.get_tensor(
+            self.models.output_details["emotion"][0]['index'])
+        
+        emotions = ["angry", "disgust", "fear", 
+                   "happy", "sad", "surprise", "neutral"]
+        return emotions[np.argmax(output)]
+
+    def speak(self, text):
+        """Thread-safe speech output"""
+        self.hardware.speak(text)
+
+# ======================
+# ANDROID SERVICE INTEGRATION
+# ======================
+class EvoCoreService(content.Context):
+    def onCreate(self):
+        super().onCreate()
+        self.evocore = EvoCore(self)
+        
+    def onStartCommand(self, intent, flags, startId):
+        self.evocore.start()
+        return START_STICKY
+        
+    def onDestroy(self):
+        self.evocore.stop()
+        super().onDestroy()
+
+# ======================
+# MODEL DEPLOYMENT NOTES
+# ======================
+"""
+Required TensorFlow Lite Models:
+1. emotion_mobilenet.tflite - Quantized MobileNet for emotion detection
+   (Input: 128x128 RGB, Output: 7 emotion classes)
+   
+2. wakeword_lstm.tflite - Custom LSTM for wake word detection
+   (Input: 1s of 16kHz audio, Output: wake word probability)
+
+3. yamnet_quantized.tflite - For general audio classification
+   (Input: 0.96s of 16kHz audio, Output: 521 sound classes)
+
+Place these in Android assets folder:
+android/app/src/main/assets/
+"""
